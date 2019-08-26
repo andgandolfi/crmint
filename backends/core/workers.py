@@ -20,6 +20,7 @@ from datetime import timedelta
 from fnmatch import fnmatch
 from functools import wraps
 import json
+import re
 import os
 from random import random
 import time
@@ -44,6 +45,7 @@ AVAILABLE = (
     'BQToMeasurementProtocol',
     'BQToStorageExporter',
     'Commenter',
+    'DataflowWorker',
     'GAAudiencesUpdater',
     'GADataImporter',
     'GAToBQImporter',
@@ -1009,3 +1011,69 @@ class BQMLTrainer(BQWorker):
     job = client.run_async_query(job_name, self._params['query'])
     job.use_legacy_sql = False
     self._begin_and_wait(job)
+
+
+class DataflowWorker(Worker):
+  """Worker to start Dataflow job."""
+
+  PARAMS = [
+    ('dataflow_project_id', 'string', True, '', 'GCP Project ID'),
+    ('template_location', 'string', True, '', 'Location of the Dataflow template'),
+    ('temp_location', 'string', True, '', 'Temporary location for the Dataflow job'),
+    ('zone', 'string', True, '', 'GCP zone where the Dataflow job will run (e.g. europe-west1-b)'),
+    ('max_workers', 'number', True, 8, 'Max number of workers for the dataflow'),
+    ('json_params', 'text', True, '', 'Dataflow job parameters in JSON format'),
+  ]
+
+  def _dataflow_setup(self):
+    credentials = ServiceAccountCredentials.from_json_keyfile_name(_KEY_FILE)
+    self._client = build('dataflow', 'v1b3', credentials=credentials)
+    job_name = self._params['template_location'].split('/')[-1]
+    job_name = '%s-%s-%s-%s' % (
+      job_name,
+      self._pipeline_id,
+      self._job_id,
+      datetime.now().strftime('%Y%m%d%H%M%S')
+    )
+    job_name = re.sub('[^0-9a-zA-Z]+', '-', job_name)
+    self._request_data = {
+      'jobName': job_name,
+      'parameters': json.loads(self._params['json_params']),
+      'environment': {
+        'tempLocation': self._params['temp_location'],
+        'zone': self._params['zone'],
+        'maxWorkers': self._params['max_workers'],
+      },
+    }
+
+  def _begin_and_wait(self):
+    self._dataflow_setup()
+    request = self._client.projects().templates().launch(
+      projectId=self._params['dataflow_project_id'],
+      gcsPath=self._params['template_location'],
+      body=self._request_data
+    )
+    try:
+      response = request.execute()
+      job_id = response['job']['id']
+      job_name = response['job']['name']
+      print('Dataflow job has started. ID: %s' % (job_id))
+      job_status = 'JOB_STATE_RUNNING'
+      request = self._client.projects().jobs().get(
+        projectId=self._params['dataflow_project_id'],
+        jobId=job_id
+      )
+      while job_status == 'JOB_STATE_RUNNING':
+        time.sleep(60)
+        response = request.execute()
+        job_status = response['currentState']
+      if job_status != 'JOB_STATE_DONE':
+        raise RuntimeError('Job %s has failed with status %s' % (
+          job_name,
+          job_status
+        ))
+    except Exception as e:
+      raise WorkerException(e)
+
+  def _execute(self):
+    self._begin_and_wait()
